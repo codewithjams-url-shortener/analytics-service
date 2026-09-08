@@ -18,6 +18,12 @@ repositories {
 	mavenLocal()
 }
 
+dependencyManagement {
+	imports {
+		mavenBom("org.testcontainers:testcontainers-bom:1.21.4")
+	}
+}
+
 dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-web")
 	implementation("org.springframework.boot:spring-boot-starter-actuator")
@@ -25,6 +31,10 @@ dependencies {
 
 	testImplementation("org.springframework.boot:spring-boot-starter-test")
 	testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+
+	testImplementation("io.floci:testcontainers-floci:1.15.0")
+	testImplementation("org.testcontainers:junit-jupiter")
+	testImplementation("software.amazon.awssdk:dynamodb:2.54.13")
 }
 
 tasks.withType<Test> {
