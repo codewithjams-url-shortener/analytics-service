@@ -10,12 +10,18 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health, prometheus
   health:
     livenessstate:
       enabled: true
     readinessstate:
       enabled: true
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+  tracing:
+    sampling:
+      probability: 1.0
 
 server:
   port: 5235
