@@ -1,6 +1,10 @@
 spring:
   application:
     name: analytics-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/url_shortener
+    username: url_shortener_admin
+    password: test
 
 management:
   endpoint:
@@ -25,3 +29,16 @@ management:
 
 server:
   port: 5235
+
+aws:
+  region: us-west-2
+  credential:
+    access-key: test
+    secret-key: test
+  sqs:
+    endpoint-override: http://localhost:4566
+    queue-url: http://localhost:4566/000000000000/click-events-queue
+  s3:
+    endpoint-override: http://localhost:4566
+    bucket-name: url-shortener-events
+
