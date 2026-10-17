@@ -5,9 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.urlshortener.analyticsservice.property.AwsProperties;
 import io.urlshortener.analyticsservice.repository.ClickEventArchiver;
-import io.urlshortener.analyticsservice.repository.ClickEventRepository;
+import io.urlshortener.analyticsservice.service.ClickEventRecorder;
 import io.urlshortener.eventcontracts.ClickEvent;
-import io.urlshortener.eventcontracts.ClickOutcome;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -16,20 +15,29 @@ import org.springframework.util.CollectionUtils;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.*;
 
-import java.time.Instant;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
- * Polls the {@code click-events} SQS queue, aggregates same-{@code shortCode} click counts in memory before writing,
- * records each event idempotently in Postgres, archives the batch to S3, and deletes the processed messages.
+ * Polls the {@code click-events} SQS queue, hands each batch to {@link ClickEventRecorder} to record in Postgres,
+ * archives the batch to S3, and deletes the processed messages.
  *
  * <p>
  *     A batch that fails partway (a Postgres or S3 error) is abandoned wholesale - none of its messages are deleted,
- *     so SQS redelivers the entire batch. That's safe rather than wasteful: {@link ClickEventRepository#recordIfNew}
- *     is idempotent on {@code eventId}, so re-processing a batch that partially succeeded before failing never
- *     double-counts anything.
+ *     so SQS redelivers the entire batch. Each half of that is safe:
  * </p>
+ * <ul>
+ *     <li>
+ *         <b>Postgres:</b> {@link ClickEventRecorder#record} is one transaction covering the {@code click_events}
+ *         insert and both rollups ({@code link_stats}, {@code link_daily_stats}). A failure rolls all of it back, so the
+ *         redelivered events are new again and are counted exactly once. Nothing is ever recorded without its counts.
+ *     </li>
+ *     <li>
+ *         <b>S3:</b> the archive runs after that transaction commits and cannot be part of it, and it receives <em>every
+ *         parsed event</em> rather than only the newly recorded ones. So if the archive fails after the commit, the
+ *         redelivery (where the recorder reports every event as a duplicate) still archives the batch. The cost is that
+ *         a redelivered batch can be archived twice, so readers of the archive should dedupe on {@code eventId}.
+ *     </li>
+ * </ul>
  *
  * <p>
  *     A message that fails only to *parse* is treated differently from a batch processing failure: it's simply left off
@@ -58,9 +66,9 @@ public class ClickEventConsumer {
 	private final ObjectMapper objectMapper;
 
 	/**
-	 * Records events idempotently and rolls them into {@code link_stats}.
+	 * Records each batch of events and their rollups atomically.
 	 */
-	private final ClickEventRepository clickEventRepository;
+	private final ClickEventRecorder clickEventRecorder;
 
 	/**
 	 * Archives each processed batch to S3.
@@ -68,8 +76,8 @@ public class ClickEventConsumer {
 	private final ClickEventArchiver clickEventArchiver;
 
 	/**
-	 * Runs one poll-and-process cycle: receive, parse, record (idempotently), aggregate into {@code
-	 * link_stats}, archive, then delete only the messages that made it all the way through.
+	 * Runs one poll-and-process cycle: receive, parse, record (one transaction covering the events and both rollups),
+	 * archive, then delete only the messages that made it all the way through.
 	 */
 	@Scheduled(fixedDelay = 5000)
 	public void pollAndProcess() {
@@ -90,16 +98,16 @@ public class ClickEventConsumer {
 		final Map<Message, ClickEvent> parsed = createSqsMessageClickEventMap(messages);
 
 		try {
-			final List<ClickEvent> newEvents = filterNewClickEvents(parsed.values().stream().toList());
-			incrementStatsPerShortCode(newEvents);
-			clickEventArchiver.archive(newEvents);
+			final List<ClickEvent> parsedEvents = parsed.values().stream().toList();
+			final int newEventCount = clickEventRecorder.record(parsedEvents);
+			clickEventArchiver.archive(parsedEvents);
 			deleteMessages(parsed.keySet());
 			log.atInfo()
 					.addKeyValue("status", "SUCCESS")
 					.addKeyValue("messagesReceived", messages.size())
 					.addKeyValue("messagesParsed", parsed.size())
-					.addKeyValue("newEvents", newEvents.size())
-					.addKeyValue("duplicateEvents", parsed.size() - newEvents.size())
+					.addKeyValue("newEvents", newEventCount)
+					.addKeyValue("duplicateEvents", parsed.size() - newEventCount)
 					.log("ClickEvent batch processed successfully");
 		} catch (RuntimeException e) {
 			log.atError()
@@ -236,119 +244,9 @@ public class ClickEventConsumer {
 	}
 
 	/**
-	 * Records every event via {@link ClickEventRepository#recordIfNew}, keeping only the ones that weren't
-	 * already-processed duplicates.
-	 *
-	 * @param events the parsed events to record.
-	 * @return the subset of {@code events} that were newly recorded.
-	 */
-	private List<ClickEvent> filterNewClickEvents(final List<ClickEvent> events) {
-		log.atDebug()
-				.addKeyValue("stage", "3")
-				.addKeyValue("status", "STARTED")
-				.log("Filter New Click Events from SQS Message");
-		final List<ClickEvent> newEvents = new ArrayList<>();
-		for (final ClickEvent event : events) {
-			final boolean isNew;
-			try {
-				isNew = clickEventRepository.recordIfNew(event);
-			} catch (Exception e) {
-				log.atWarn()
-						.setCause(e)
-						.addKeyValue("stage", "3")
-						.addKeyValue("status", "FAILED")
-						.addKeyValue("event", event)
-						.log("Failed to Record the event");
-				throw e;
-			}
-			if (isNew) {
-				newEvents.add(event);
-			}
-		}
-		log.atDebug()
-				.addKeyValue("stage", "3")
-				.addKeyValue("status", "SUCCESS")
-				.addKeyValue("newEventsCount", newEvents.size())
-				.log("New Click Events filtered from SQS Message");
-		return newEvents;
-	}
-
-	/**
-	 * Groups the batch's new events by short code and applies each group's aggregated counts to {@code link_stats}
-	 * in one call per short code, rather than one write per event.
-	 *
-	 * @param events the newly recorded events for this batch.
-	 */
-	private void incrementStatsPerShortCode(final List<ClickEvent> events) {
-		log.atDebug()
-				.addKeyValue("stage", "4")
-				.addKeyValue("status", "STARTED")
-				.addKeyValue("newEvents", events.size())
-				.log("Incrementing stats per Short Code");
-		final Map<String, List<ClickEvent>> eventsGroupedByShortCode = events.stream()
-				.collect(Collectors.groupingBy(ClickEvent::shortCode));
-		eventsGroupedByShortCode.forEach(this::processClickEventsByShortCode);
-		log.atDebug()
-				.addKeyValue("stage", "4")
-				.addKeyValue("status", "SUCCESS")
-				.addKeyValue("newEvents", events.size())
-				.log("Incremented stats per Short Code");
-	}
-
-	/**
-	 * Counts one short code's events by outcome and applies the aggregated deltas to {@code link_stats}.
-	 *
-	 * @param shortCode   the short code this group of events belongs to.
-	 * @param eventsGroup this short code's events from the current batch.
-	 */
-	private void processClickEventsByShortCode(final String shortCode, final List<ClickEvent> eventsGroup) {
-		log.atDebug()
-				.addKeyValue("stage", "4.1")
-				.addKeyValue("status", "STARTED")
-				.addKeyValue("shortCode", shortCode)
-				.log("Incrementing stats for a Short Code");
-		final long resolved = countByOutcome(eventsGroup, ClickOutcome.RESOLVED);
-		final long expired = countByOutcome(eventsGroup, ClickOutcome.EXPIRED);
-		final long notFound = countByOutcome(eventsGroup, ClickOutcome.NOT_FOUND);
-		final Instant lastClickedAt = eventsGroup.stream()
-				.map(e -> Instant.ofEpochMilli(e.timestamp()))
-				.max(Instant::compareTo)
-				.orElseThrow();
-		try {
-			clickEventRepository.incrementStats(shortCode, resolved, expired, notFound, lastClickedAt);
-		} catch (Exception e) {
-			log.atWarn()
-					.setCause(e)
-					.addKeyValue("stage", "4.1")
-					.addKeyValue("status", "FAILED")
-					.addKeyValue("shortCode", shortCode)
-					.log("Something went wrong while incrementing the Short Code stats");
-			throw e;
-		}
-		log.atDebug()
-				.addKeyValue("stage", "4.1")
-				.addKeyValue("status", "SUCCESS")
-				.addKeyValue("shortCode", shortCode)
-				.log("Incremented stats for a Short Code");
-	}
-
-	/**
-	 * Counts how many of the given events have the given outcome.
-	 *
-	 * @param events  the events to count over.
-	 * @param outcome the outcome to count.
-	 * @return the number of matching events.
-	 */
-	private long countByOutcome(final List<ClickEvent> events, final ClickOutcome outcome) {
-		return events.stream()
-				.filter(e -> e.outcome() == outcome)
-				.count();
-	}
-
-	/**
 	 * Deletes a fully-processed batch's messages from SQS in one call. Any individual entries that fail to delete are
-	 * logged (not thrown) - they'll simply be redelivered and safely reprocessed thanks to
-	 * {@link ClickEventRepository#recordIfNew}'s idempotency.
+	 * logged (not thrown) - they'll simply be redelivered and safely reprocessed: {@link ClickEventRecorder#record}
+	 * reports them as duplicates and counts nothing twice.
 	 *
 	 * @param messages the messages whose processing completed successfully.
 	 */

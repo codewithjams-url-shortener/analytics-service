@@ -3,7 +3,7 @@ package io.urlshortener.analyticsservice.consumer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.urlshortener.analyticsservice.property.AwsProperties;
 import io.urlshortener.analyticsservice.repository.ClickEventArchiver;
-import io.urlshortener.analyticsservice.repository.ClickEventRepository;
+import io.urlshortener.analyticsservice.service.ClickEventRecorder;
 import io.urlshortener.eventcontracts.ClickEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -23,14 +23,13 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
@@ -43,7 +42,7 @@ class ClickEventConsumerTest {
 	private SqsClient sqsClient;
 
 	@Mock
-	private ClickEventRepository clickEventRepository;
+	private ClickEventRecorder clickEventRecorder;
 
 	@Mock
 	private ClickEventArchiver clickEventArchiver;
@@ -57,7 +56,7 @@ class ClickEventConsumerTest {
 		final AwsProperties awsProperties = new AwsProperties();
 		awsProperties.setSqs(sqs);
 
-		consumer = new ClickEventConsumer(sqsClient, awsProperties, new ObjectMapper(), clickEventRepository,
+		consumer = new ClickEventConsumer(sqsClient, awsProperties, new ObjectMapper(), clickEventRecorder,
 				clickEventArchiver);
 	}
 
@@ -71,16 +70,16 @@ class ClickEventConsumerTest {
 		consumer.pollAndProcess();
 
 		// Assert
-		verifyNoInteractions(clickEventRepository, clickEventArchiver);
+		verifyNoInteractions(clickEventRecorder, clickEventArchiver);
 	}
 
 	@Test
-	void pollAndProcess_shouldRecordArchiveAndDelete_whenANewEventIsReceived() {
+	void pollAndProcess_shouldRecordArchiveAndDelete_whenAnEventIsReceived() {
 		// Arrange
 		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
 		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
 				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class))).willReturn(true);
+		given(clickEventRecorder.record(anyList())).willReturn(1);
 		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
 				.willReturn(DeleteMessageBatchResponse.builder().build());
 
@@ -88,13 +87,12 @@ class ClickEventConsumerTest {
 		consumer.pollAndProcess();
 
 		// Assert
-		final ArgumentCaptor<ClickEvent> eventCaptor = ArgumentCaptor.forClass(ClickEvent.class);
-		verify(clickEventRepository).recordIfNew(eventCaptor.capture());
-		assertThat(eventCaptor.getValue().eventId()).isEqualTo("event-1");
-		assertThat(eventCaptor.getValue().shortCode()).isEqualTo("abc1234");
-
-		verify(clickEventRepository).incrementStats(eq("abc1234"), eq(1L), eq(0L), eq(0L), any(Instant.class));
-		verify(clickEventArchiver).archive(List.of(eventCaptor.getValue()));
+		final ArgumentCaptor<List<ClickEvent>> recordedCaptor = eventListCaptor();
+		verify(clickEventRecorder).record(recordedCaptor.capture());
+		assertThat(recordedCaptor.getValue()).hasSize(1);
+		assertThat(recordedCaptor.getValue().getFirst().eventId()).isEqualTo("event-1");
+		assertThat(recordedCaptor.getValue().getFirst().shortCode()).isEqualTo("abc1234");
+		verify(clickEventArchiver).archive(recordedCaptor.getValue());
 
 		final ArgumentCaptor<DeleteMessageBatchRequest> deleteCaptor = ArgumentCaptor.forClass(DeleteMessageBatchRequest.class);
 		verify(sqsClient).deleteMessageBatch(deleteCaptor.capture());
@@ -102,12 +100,12 @@ class ClickEventConsumerTest {
 	}
 
 	@Test
-	void pollAndProcess_shouldNotIncrementStats_whenEventIsADuplicate() {
+	void pollAndProcess_shouldStillArchiveAndDelete_whenEveryEventIsADuplicate() {
 		// Arrange
 		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
 		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
 				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class))).willReturn(false);
+		given(clickEventRecorder.record(anyList())).willReturn(0);
 		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
 				.willReturn(DeleteMessageBatchResponse.builder().build());
 
@@ -115,10 +113,35 @@ class ClickEventConsumerTest {
 		consumer.pollAndProcess();
 
 		// Assert
-		verify(clickEventRepository, never()).incrementStats(any(), anyLong(), anyLong(), anyLong(), any());
-		verify(clickEventArchiver).archive(List.of());
-		// A duplicate still counts as successfully processed - the message should still be deleted.
+		// The recorder reports a redelivered batch as all duplicates, but the archive must still receive it: the previous
+		// attempt may have committed to Postgres and then failed to archive. A duplicate is also still successfully
+		// processed, so the message is deleted.
+		final ArgumentCaptor<List<ClickEvent>> archivedCaptor = eventListCaptor();
+		verify(clickEventArchiver).archive(archivedCaptor.capture());
+		assertThat(archivedCaptor.getValue()).extracting(ClickEvent::eventId).containsExactly("event-1");
 		verify(sqsClient).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+	}
+
+	@Test
+	void pollAndProcess_shouldHandTheSameEventsToRecorderAndArchiver_whenMultipleEventsAreReceived() {
+		// Arrange
+		final Message first = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
+		final Message second = sqsMessage("msg-2", envelope("event-2", "xyz7890", "EXPIRED"));
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(first, second).build());
+		given(clickEventRecorder.record(anyList())).willReturn(2);
+		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
+				.willReturn(DeleteMessageBatchResponse.builder().build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		final ArgumentCaptor<List<ClickEvent>> recordedCaptor = eventListCaptor();
+		verify(clickEventRecorder).record(recordedCaptor.capture());
+		assertThat(recordedCaptor.getValue()).extracting(ClickEvent::eventId)
+				.containsExactlyInAnyOrder("event-1", "event-2");
+		verify(clickEventArchiver).archive(recordedCaptor.getValue());
 	}
 
 	@Test
@@ -128,7 +151,7 @@ class ClickEventConsumerTest {
 		final Message badMessage = sqsMessage("msg-bad", "not-valid-json");
 		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
 				.willReturn(ReceiveMessageResponse.builder().messages(goodMessage, badMessage).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class))).willReturn(true);
+		given(clickEventRecorder.record(anyList())).willReturn(1);
 		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
 				.willReturn(DeleteMessageBatchResponse.builder().build());
 
@@ -136,7 +159,9 @@ class ClickEventConsumerTest {
 		consumer.pollAndProcess();
 
 		// Assert
-		verify(clickEventRepository, times(1)).recordIfNew(any(ClickEvent.class));
+		final ArgumentCaptor<List<ClickEvent>> recordedCaptor = eventListCaptor();
+		verify(clickEventRecorder).record(recordedCaptor.capture());
+		assertThat(recordedCaptor.getValue()).extracting(ClickEvent::eventId).containsExactly("event-1");
 		final ArgumentCaptor<DeleteMessageBatchRequest> deleteCaptor = ArgumentCaptor.forClass(DeleteMessageBatchRequest.class);
 		verify(sqsClient).deleteMessageBatch(deleteCaptor.capture());
 		assertThat(deleteCaptor.getValue().entries())
@@ -156,42 +181,21 @@ class ClickEventConsumerTest {
 		consumer.pollAndProcess();
 
 		// Assert
-		// The bad message is excluded from the batch entirely - nothing is ever recorded for it - but a
-		// batch reduced to zero parsed events isn't itself a failure, so archive still runs (as a
-		// harmless no-op for an empty batch); deleteMessageBatch is skipped entirely since a real
-		// DeleteMessageBatch request with zero entries would just be rejected by AWS.
-		verifyNoInteractions(clickEventRepository);
+		// The bad message is excluded from the batch entirely, but a batch reduced to zero parsed events isn't itself a
+		// failure, so the recorder and archiver still run (as harmless no-ops for an empty batch). deleteMessageBatch is
+		// skipped entirely since a real DeleteMessageBatch request with zero entries would just be rejected by AWS.
+		verify(clickEventRecorder).record(List.of());
 		verify(clickEventArchiver).archive(List.of());
 		verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
 	}
 
 	@Test
-	void pollAndProcess_shouldIncrementStatsOnce_whenMultipleEventsShareTheSameShortCode() {
-		// Arrange
-		final Message resolved = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
-		final Message expired = sqsMessage("msg-2", envelope("event-2", "abc1234", "EXPIRED"));
-		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
-				.willReturn(ReceiveMessageResponse.builder().messages(resolved, expired).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class))).willReturn(true);
-		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
-				.willReturn(DeleteMessageBatchResponse.builder().build());
-
-		// Act
-		consumer.pollAndProcess();
-
-		// Assert
-		verify(clickEventRepository, times(1))
-				.incrementStats(eq("abc1234"), eq(1L), eq(1L), eq(0L), any(Instant.class));
-	}
-
-	@Test
-	void pollAndProcess_shouldNotArchiveOrDelete_whenRecordingAnEventFails() {
+	void pollAndProcess_shouldNotArchiveOrDelete_whenRecordingFails() {
 		// Arrange
 		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
 		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
 				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class)))
-				.willThrow(new RuntimeException("DB unavailable"));
+		given(clickEventRecorder.record(anyList())).willThrow(new RuntimeException("DB unavailable"));
 
 		// Act
 		consumer.pollAndProcess();
@@ -202,18 +206,20 @@ class ClickEventConsumerTest {
 	}
 
 	@Test
-	void pollAndProcess_shouldNotDelete_whenArchivingFails() {
+	void pollAndProcess_shouldNotDelete_whenArchivingFailsAfterRecordingSucceeds() {
 		// Arrange
 		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
 		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
 				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class))).willReturn(true);
+		given(clickEventRecorder.record(anyList())).willReturn(1);
 		doThrow(new RuntimeException("S3 unavailable")).when(clickEventArchiver).archive(any());
 
 		// Act
 		consumer.pollAndProcess();
 
 		// Assert
+		// Recording has already committed here. The message must stay on the queue so the redelivery re-archives it.
+		verify(clickEventRecorder).record(anyList());
 		verify(sqsClient, never()).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
 	}
 
@@ -227,7 +233,7 @@ class ClickEventConsumerTest {
 		assertThatThrownBy(() -> consumer.pollAndProcess())
 				.isInstanceOf(RuntimeException.class)
 				.hasMessage("SQS unavailable");
-		verifyNoInteractions(clickEventRepository, clickEventArchiver);
+		verifyNoInteractions(clickEventRecorder, clickEventArchiver);
 	}
 
 	@Test
@@ -236,7 +242,7 @@ class ClickEventConsumerTest {
 		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
 		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
 				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
-		given(clickEventRepository.recordIfNew(any(ClickEvent.class))).willReturn(true);
+		given(clickEventRecorder.record(anyList())).willReturn(1);
 		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
 				.willReturn(DeleteMessageBatchResponse.builder()
 						.successful(List.of())
@@ -244,7 +250,12 @@ class ClickEventConsumerTest {
 						.build());
 
 		// Act & Assert
-		consumer.pollAndProcess();
+		assertThatCode(() -> consumer.pollAndProcess()).doesNotThrowAnyException();
+	}
+
+	@SuppressWarnings({"unchecked", "rawtypes"})
+	private ArgumentCaptor<List<ClickEvent>> eventListCaptor() {
+		return (ArgumentCaptor) ArgumentCaptor.forClass(List.class);
 	}
 
 	private Message sqsMessage(final String id, final String body) {

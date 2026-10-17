@@ -6,11 +6,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Answers;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.jdbc.core.simple.JdbcClient;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 
@@ -140,6 +142,57 @@ class JdbcClickEventRepositoryTest {
 		verify(statementSpec).param("resolvedCount", 2L);
 		verify(statementSpec).param("expiredCount", 1L);
 		verify(statementSpec).param("notFoundCount", 3L);
+	}
+
+	@Test
+	void incrementStats_shouldKeepTheLatestClickTimestamp_whenCalled() {
+		// Arrange
+		given(statementSpec.update()).willReturn(1);
+
+		// Act
+		repository.incrementStats(SHORT_CODE, 1L, 0L, 0L, Instant.now());
+
+		// Assert
+		// A redelivered older batch must not move lastClickedAt backwards.
+		final ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+		verify(jdbcClient).sql(sqlCaptor.capture());
+		assertThat(sqlCaptor.getValue()).contains("GREATEST(link_stats.last_clicked_at, EXCLUDED.last_clicked_at)");
+	}
+
+	@Test
+	void incrementDailyStats_shouldBindShortCodeDayAndDeltas_whenCalled() {
+		// Arrange
+		given(statementSpec.update()).willReturn(1);
+		final LocalDate day = LocalDate.of(2026, 10, 16);
+
+		// Act
+		repository.incrementDailyStats(SHORT_CODE, day, 2L, 1L, 3L);
+
+		// Assert
+		verify(statementSpec).param("shortCode", SHORT_CODE);
+		verify(statementSpec).param("day", day);
+		verify(statementSpec).param("resolvedCount", 2L);
+		verify(statementSpec).param("expiredCount", 1L);
+		verify(statementSpec).param("notFoundCount", 3L);
+	}
+
+	@Test
+	void incrementDailyStats_shouldIssueAnAddingUpsertOnShortCodeAndDay_whenCalled() {
+		// Arrange
+		given(statementSpec.update()).willReturn(1);
+
+		// Act
+		repository.incrementDailyStats(SHORT_CODE, LocalDate.of(2026, 10, 16), 1L, 0L, 0L);
+
+		// Assert
+		final ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+		verify(jdbcClient).sql(sqlCaptor.capture());
+		assertThat(sqlCaptor.getValue())
+				.contains("INSERT INTO link_daily_stats")
+				.contains("ON CONFLICT (short_code, day) DO UPDATE SET")
+				.contains("resolved_count = link_daily_stats.resolved_count + EXCLUDED.resolved_count")
+				.contains("expired_count = link_daily_stats.expired_count + EXCLUDED.expired_count")
+				.contains("not_found_count = link_daily_stats.not_found_count + EXCLUDED.not_found_count");
 	}
 
 	private ClickEvent clickEvent(final ClickOutcome outcome) {

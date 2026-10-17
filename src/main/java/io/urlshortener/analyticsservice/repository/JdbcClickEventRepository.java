@@ -7,6 +7,7 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneOffset;
 
 /**
@@ -40,7 +41,21 @@ public class JdbcClickEventRepository implements ClickEventRepository {
 			resolved_count = link_stats.resolved_count + EXCLUDED.resolved_count,
 			expired_count = link_stats.expired_count + EXCLUDED.expired_count,
 			not_found_count = link_stats.not_found_count + EXCLUDED.not_found_count,
-			last_clicked_at = EXCLUDED.last_clicked_at
+			last_clicked_at = GREATEST(link_stats.last_clicked_at, EXCLUDED.last_clicked_at)
+			""";
+
+	/**
+	 * Upserts {@code link_daily_stats}.<br/>
+	 * Creates the row on a short code's first recorded click of a UTC day, or increments its existing per-outcome
+	 * counters otherwise. The {@code day} is part of the conflict key, so it is never updated.
+	 */
+	private static final String INCREMENT_DAILY_STATS_QUERY = """
+			INSERT INTO link_daily_stats (short_code, day, resolved_count, expired_count, not_found_count)
+			VALUES (:shortCode, :day, :resolvedCount, :expiredCount, :notFoundCount)
+			ON CONFLICT (short_code, day) DO UPDATE SET
+			resolved_count = link_daily_stats.resolved_count + EXCLUDED.resolved_count,
+			expired_count = link_daily_stats.expired_count + EXCLUDED.expired_count,
+			not_found_count = link_daily_stats.not_found_count + EXCLUDED.not_found_count
 			""";
 
 	/**
@@ -98,6 +113,31 @@ public class JdbcClickEventRepository implements ClickEventRepository {
 		log.atInfo()
 				.addKeyValue("affectedRows", affectedRows)
 				.log("Increment Stats updated");
+	}
+
+	/**
+	 * Applies aggregated per-outcome click counts for one UTC day to {@code link_daily_stats}, incrementing the existing
+	 * counters or creating the row if this is the short code's first recorded click that day.
+	 *
+	 * @param shortCode     the short code the counts belong to.
+	 * @param day           the UTC day the clicks occurred on.
+	 * @param resolvedDelta additional RESOLVED clicks to add.
+	 * @param expiredDelta  additional EXPIRED clicks to add.
+	 * @param notFoundDelta additional NOT_FOUND clicks to add.
+	 */
+	@Override
+	public void incrementDailyStats(final String shortCode, final LocalDate day, final long resolvedDelta,
+									final long expiredDelta, final long notFoundDelta) {
+		final JdbcClient.StatementSpec statementSpec = jdbcClient.sql(INCREMENT_DAILY_STATS_QUERY)
+				.param("shortCode", shortCode)
+				.param("day", day)
+				.param("resolvedCount", resolvedDelta)
+				.param("expiredCount", expiredDelta)
+				.param("notFoundCount", notFoundDelta);
+		final int affectedRows = statementSpec.update();
+		log.atInfo()
+				.addKeyValue("affectedRows", affectedRows)
+				.log("Increment Daily Stats updated");
 	}
 
 }
