@@ -41,4 +41,8 @@ aws:
   s3:
     endpoint-override: http://localhost:4566
     bucket-name: url-shortener-events
+  dynamodb:
+    endpoint-override: http://localhost:4566
+    tables:
+      links-table: "Links"
 

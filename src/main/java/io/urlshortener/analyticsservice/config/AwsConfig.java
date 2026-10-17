@@ -11,6 +11,8 @@ import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.sqs.SqsClient;
 
@@ -127,6 +129,57 @@ public class AwsConfig {
 				.endpointOverride(endpoint)
 				.credentialsProvider(credentialsProvider)
 				.forcePathStyle(true)
+				.build();
+	}
+
+	/**
+	 * Builds the DynamoDB client used by the repository layer.
+	 *
+	 * @param region              the AWS region to target.
+	 * @param credentialsProvider the credentials to authenticate with.
+	 * @return a {@link DynamoDbClient}, pointed at the configured endpoint override when present
+	 * (e.g. for local development against floci).
+	 */
+	@Bean
+	public DynamoDbClient dynamoDbClient(final Region region, final AwsCredentialsProvider credentialsProvider) {
+		final String url = awsProperties.getDynamoDb().getEndpointOverride();
+		final URI endpoint = URI.create(url);
+		log.atDebug()
+				.addKeyValue("bean", DynamoDbClient.class.getSimpleName())
+				.addKeyValue("region.present", Objects.nonNull(region))
+				.addKeyValue("credentialsProvider.present", Objects.nonNull(credentialsProvider))
+				.addKeyValue("endpoint-override.present", StringUtils.hasText(url))
+				.log("Bean: DynamoDbClient created");
+		return DynamoDbClient.builder()
+				.region(region)
+				.endpointOverride(endpoint)
+				.credentialsProvider(credentialsProvider)
+				.build();
+	}
+
+	/**
+	 * Builds the DynamoDB Streams client used by the Links table stream consumer.
+	 *
+	 * @param region              the AWS region to target.
+	 * @param credentialsProvider the credentials to authenticate with.
+	 * @return a {@link DynamoDbStreamsClient}, pointed at the configured endpoint override when present
+	 * (e.g. for local development against floci).
+	 */
+	@Bean
+	public DynamoDbStreamsClient dynamoDbStreamsClient(final Region region,
+													   final AwsCredentialsProvider credentialsProvider) {
+		final String url = awsProperties.getDynamoDb().getEndpointOverride();
+		final URI endpoint = URI.create(url);
+		log.atDebug()
+				.addKeyValue("bean", DynamoDbStreamsClient.class.getSimpleName())
+				.addKeyValue("region.present", Objects.nonNull(region))
+				.addKeyValue("credentialsProvider.present", Objects.nonNull(credentialsProvider))
+				.addKeyValue("endpoint-override.present", StringUtils.hasText(url))
+				.log("Bean: DynamoDbStreamsClient created");
+		return DynamoDbStreamsClient.builder()
+				.region(region)
+				.endpointOverride(endpoint)
+				.credentialsProvider(credentialsProvider)
 				.build();
 	}
 
