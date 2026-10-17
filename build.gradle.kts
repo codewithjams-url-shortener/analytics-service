@@ -36,6 +36,7 @@ dependencies {
 	implementation("org.flywaydb:flyway-database-postgresql")
 	implementation("software.amazon.awssdk:sqs:2.54.13")
 	implementation("software.amazon.awssdk:s3:2.54.13")
+	implementation("software.amazon.awssdk:dynamodb:2.54.13")
 	implementation("io.url-shortener:event-contracts:0.1.0")
 	implementation("io.url-shortener:service-common:0.1.0")
 
@@ -47,7 +48,6 @@ dependencies {
 
 	testImplementation("io.floci:testcontainers-floci:1.15.0")
 	testImplementation("org.testcontainers:junit-jupiter")
-	testImplementation("software.amazon.awssdk:dynamodb:2.54.13")
 }
 
 tasks.withType<Test> {

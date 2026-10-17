@@ -4,6 +4,8 @@ import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.util.Map;
+
 /**
  * Binds the {@code aws.*} configuration properties used to construct the AWS SDK beans in
  * {@link io.urlshortener.analyticsservice.config.AwsConfig AwsConfig}.
@@ -32,6 +34,11 @@ public class AwsProperties {
 	 * S3-specific configuration.
 	 */
 	private S3 s3;
+
+	/**
+	 * DynamoDB-specific configuration.
+	 */
+	private DynamoDb dynamoDb;
 
 	/**
 	 * Static AWS credentials, configured directly rather than resolved via the default provider chain.
@@ -88,6 +95,28 @@ public class AwsProperties {
 		 * Name of the S3 bucket raw click events are archived to.
 		 */
 		private String bucketName;
+
+	}
+
+	/**
+	 * DynamoDB-specific configuration: an optional local endpoint override, and the map of logical table names (see
+	 * {@link io.urlshortener.analyticsservice.constant.AwsConstants AwsConstants}) to their actual configured table
+	 * names.
+	 */
+	@Getter
+	@Setter
+	public static class DynamoDb {
+
+		/**
+		 * Local DynamoDB endpoint to target instead of the real AWS endpoint, if set (e.g. floci).
+		 */
+		private String endpointOverride;
+
+		/**
+		 * Maps logical table keys (see {@link io.urlshortener.analyticsservice.constant.AwsConstants AwsConstants}) to
+		 * actual table names.
+		 */
+		private Map<String, String> tables;
 
 	}
 
