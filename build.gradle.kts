@@ -65,9 +65,6 @@ dependencies {
 	compileOnly("org.projectlombok:lombok:1.18.48")
 	annotationProcessor("org.projectlombok:lombok:1.18.48")
 
-	testImplementation("io.floci:testcontainers-floci:1.15.0")
-	testImplementation("org.testcontainers:junit-jupiter")
-
 	"integrationTestImplementation"("org.springframework.boot:spring-boot-starter-web")
 	"integrationTestImplementation"("org.springframework.boot:spring-boot-starter-test")
 	"integrationTestImplementation"("org.springframework.boot:spring-boot-starter-jdbc")

@@ -1,7 +1,8 @@
-package io.urlshortener.analyticsservice;
+package io.urlshortener.analyticsservice.integrationtest;
 
 import io.floci.testcontainers.FlociContainer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -17,6 +18,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Testcontainers
+@EnabledIfSystemProperty(named = "spring.profiles.active", matches = "local")
 class FlociContainerIntegrationTest {
 
 	@Container
