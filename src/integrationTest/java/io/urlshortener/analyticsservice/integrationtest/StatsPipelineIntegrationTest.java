@@ -204,6 +204,32 @@ public class StatsPipelineIntegrationTest extends IntegrationTestSupport {
 	}
 
 	@Test
+	void prometheus_shouldExposeTheSqsConsumerMetrics_whenClicksHaveBeenProcessed() {
+
+		// Arrange
+		final String shortCode = createLink("https://example.com/metered")
+				.get(LinksApiConstants.FIELD_SHORT_CODE).asText();
+		click(shortCode);
+		click(shortCode);
+		awaitStats(shortCode, body -> count(body, StatsApiConstants.FIELD_RESOLVED) == 2, "two clicks to be counted");
+
+		// Act & Assert
+		// The age is recorded when a batch is acknowledged, a moment after the stats reflect it, hence the polling.
+		awaiting().untilAsserted(() -> {
+			final String scrape = getPrometheus();
+			assertThat(metricValue(scrape, "sqs_consumer_event_age_seconds_count", null).orElse(0))
+					.as("click events whose age was recorded").isGreaterThanOrEqualTo(2.0);
+			assertThat(metricValue(scrape, "sqs_consumer_batches_total", "outcome=\"success\"").orElse(0))
+					.as("successful batches").isGreaterThanOrEqualTo(1.0);
+			assertThat(metricValue(scrape, "sqs_consumer_queue_depth", "state=\"visible\"").isPresent())
+					.as("queue depth gauge is exposed").isTrue();
+			assertThat(metricValue(scrape, "sqs_consumer_since_last_poll_seconds", null).orElse(-1))
+					.as("seconds since the consumer last reached SQS").isBetween(0.0, 60.0);
+		});
+
+	}
+
+	@Test
 	void getLinkStats_shouldReturn400_whenFromIsAfterTo() {
 
 		// Act

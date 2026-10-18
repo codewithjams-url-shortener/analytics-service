@@ -85,6 +85,9 @@ public class FaultToleranceIntegrationTest extends IntegrationTestSupport {
 				assertThat(rowCount("click_events", shortCode)).as("click_events rows while the rollup fails").isZero();
 				assertThat(rowCount("link_stats", shortCode)).as("link_stats rows while the rollup fails").isZero();
 			});
+			// The failing batches are visible to an operator, not just in the logs.
+			assertThat(metricValue(getPrometheus(), "sqs_consumer_batches_total", "outcome=\"failure\"").orElse(0))
+					.as("failed batches reported while the rollup fails").isGreaterThanOrEqualTo(1.0);
 
 		} finally {
 			analyticsJdbcTemplate.execute("ALTER TABLE link_daily_stats DROP CONSTRAINT IF EXISTS " + constraint);

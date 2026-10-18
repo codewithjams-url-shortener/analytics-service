@@ -1,6 +1,7 @@
 package io.urlshortener.analyticsservice.consumer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.urlshortener.analyticsservice.metrics.SqsConsumerMetrics;
 import io.urlshortener.analyticsservice.property.AwsProperties;
 import io.urlshortener.analyticsservice.repository.ClickEventArchiver;
 import io.urlshortener.analyticsservice.service.ClickEventRecorder;
@@ -30,8 +31,10 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 @ExtendWith(MockitoExtension.class)
 class ClickEventConsumerTest {
@@ -47,6 +50,9 @@ class ClickEventConsumerTest {
 	@Mock
 	private ClickEventArchiver clickEventArchiver;
 
+	@Mock
+	private SqsConsumerMetrics sqsConsumerMetrics;
+
 	private ClickEventConsumer consumer;
 
 	@BeforeEach
@@ -57,7 +63,7 @@ class ClickEventConsumerTest {
 		awsProperties.setSqs(sqs);
 
 		consumer = new ClickEventConsumer(sqsClient, awsProperties, new ObjectMapper(), clickEventRecorder,
-				clickEventArchiver);
+				clickEventArchiver, sqsConsumerMetrics);
 	}
 
 	@Test
@@ -251,6 +257,129 @@ class ClickEventConsumerTest {
 
 		// Act & Assert
 		assertThatCode(() -> consumer.pollAndProcess()).doesNotThrowAnyException();
+	}
+
+	@Test
+	void pollAndProcess_shouldReportThePollTheEventAgesAndTheBatch_whenABatchIsProcessed() {
+		// Arrange
+		final Message first = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
+		final Message second = sqsMessage("msg-2", envelope("event-2", "xyz7890", "EXPIRED"));
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(first, second).build());
+		given(clickEventRecorder.record(anyList())).willReturn(2);
+		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
+				.willReturn(DeleteMessageBatchResponse.builder().build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		verify(sqsConsumerMetrics).pollSucceeded();
+		verify(sqsConsumerMetrics, times(2)).recordEventAge(any(Instant.class));
+		verify(sqsConsumerMetrics).batchSucceeded();
+		verify(sqsConsumerMetrics, never()).batchFailed();
+	}
+
+	@Test
+	void pollAndProcess_shouldOnlyReportThePoll_whenNoMessagesAreReceived() {
+		// Arrange
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(List.of()).build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		// An empty receive still proves the consumer is alive and reaching SQS, but there is no batch to report.
+		verify(sqsConsumerMetrics).pollSucceeded();
+		verifyNoMoreInteractions(sqsConsumerMetrics);
+	}
+
+	@Test
+	void pollAndProcess_shouldReportABatchFailureAndNoEventAge_whenRecordingFails() {
+		// Arrange
+		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
+		given(clickEventRecorder.record(anyList())).willThrow(new RuntimeException("DB unavailable"));
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		// The message stays on the queue, so it has not been acknowledged and its age must not be recorded yet.
+		verify(sqsConsumerMetrics).batchFailed();
+		verify(sqsConsumerMetrics, never()).batchSucceeded();
+		verify(sqsConsumerMetrics, never()).recordEventAge(any(Instant.class));
+	}
+
+	@Test
+	void pollAndProcess_shouldReportABatchFailureAndNoEventAge_whenArchivingFailsAfterRecordingSucceeds() {
+		// Arrange
+		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
+		given(clickEventRecorder.record(anyList())).willReturn(1);
+		doThrow(new RuntimeException("S3 unavailable")).when(clickEventArchiver).archive(any());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		verify(sqsConsumerMetrics).batchFailed();
+		verify(sqsConsumerMetrics, never()).recordEventAge(any(Instant.class));
+	}
+
+	@Test
+	void pollAndProcess_shouldCountTheParseFailureWithoutFailingTheBatch_whenOneMessageIsMalformed() {
+		// Arrange
+		final Message good = sqsMessage("msg-good", envelope("event-1", "abc1234", "RESOLVED"));
+		final Message bad = sqsMessage("msg-bad", "not-valid-json");
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(good, bad).build());
+		given(clickEventRecorder.record(anyList())).willReturn(1);
+		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
+				.willReturn(DeleteMessageBatchResponse.builder().build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		verify(sqsConsumerMetrics).parseFailed();
+		verify(sqsConsumerMetrics).batchSucceeded();
+		verify(sqsConsumerMetrics).recordEventAge(any(Instant.class));
+		verify(sqsConsumerMetrics, never()).batchFailed();
+	}
+
+	@Test
+	void pollAndProcess_shouldNotCountASuccessfulBatch_whenEveryMessageIsUnparseable() {
+		// Arrange
+		final Message bad = sqsMessage("msg-bad", "not-valid-json");
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(bad).build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		// Nothing was processed, so it is neither a success nor a failure: only the parse error is counted.
+		verify(sqsConsumerMetrics).parseFailed();
+		verify(sqsConsumerMetrics).pollSucceeded();
+		verify(sqsConsumerMetrics, never()).batchSucceeded();
+		verify(sqsConsumerMetrics, never()).batchFailed();
+		verify(sqsConsumerMetrics, never()).recordEventAge(any(Instant.class));
+	}
+
+	@Test
+	void pollAndProcess_shouldReportTheReceiveFailureAndNoPoll_whenReceivingFails() {
+		// Arrange
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willThrow(new RuntimeException("SQS unavailable"));
+
+		// Act & Assert
+		assertThatThrownBy(() -> consumer.pollAndProcess()).isInstanceOf(RuntimeException.class);
+		verify(sqsConsumerMetrics).receiveFailed();
+		verify(sqsConsumerMetrics, never()).pollSucceeded();
 	}
 
 	@SuppressWarnings({"unchecked", "rawtypes"})

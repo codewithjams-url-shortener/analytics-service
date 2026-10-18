@@ -3,6 +3,7 @@ package io.urlshortener.analyticsservice.consumer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.urlshortener.analyticsservice.metrics.SqsConsumerMetrics;
 import io.urlshortener.analyticsservice.property.AwsProperties;
 import io.urlshortener.analyticsservice.repository.ClickEventArchiver;
 import io.urlshortener.analyticsservice.service.ClickEventRecorder;
@@ -15,6 +16,7 @@ import org.springframework.util.CollectionUtils;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.*;
 
+import java.time.Instant;
 import java.util.*;
 
 /**
@@ -76,6 +78,11 @@ public class ClickEventConsumer {
 	private final ClickEventArchiver clickEventArchiver;
 
 	/**
+	 * Reports how far behind the consumer is and how its batches fare.
+	 */
+	private final SqsConsumerMetrics sqsConsumerMetrics;
+
+	/**
 	 * Runs one poll-and-process cycle: receive, parse, record (one transaction covering the events and both rollups),
 	 * archive, then delete only the messages that made it all the way through.
 	 */
@@ -102,6 +109,7 @@ public class ClickEventConsumer {
 			final int newEventCount = clickEventRecorder.record(parsedEvents);
 			clickEventArchiver.archive(parsedEvents);
 			deleteMessages(parsed.keySet());
+			recordBatchSuccess(parsedEvents);
 			log.atInfo()
 					.addKeyValue("status", "SUCCESS")
 					.addKeyValue("messagesReceived", messages.size())
@@ -110,6 +118,7 @@ public class ClickEventConsumer {
 					.addKeyValue("duplicateEvents", parsed.size() - newEventCount)
 					.log("ClickEvent batch processed successfully");
 		} catch (RuntimeException e) {
+			sqsConsumerMetrics.batchFailed();
 			log.atError()
 					.setCause(e)
 					.addKeyValue("status", "FAILED")
@@ -117,6 +126,26 @@ public class ClickEventConsumer {
 					.addKeyValue("messagesParsed", parsed.size())
 					.log("Failed to process ClickEvent batch, leaving message for redelivery/DLQ");
 		}
+	}
+
+	/**
+	 * Reports a batch that was recorded, archived and acknowledged: the age of each of its events, and the batch itself.
+	 *
+	 * <p>
+	 *     A batch with no parsed events (every message was unparseable) is not counted as a success: nothing was
+	 *     processed, and the unparseable messages are already counted as parse errors.
+	 * </p>
+	 *
+	 * @param parsedEvents the events of the acknowledged batch.
+	 */
+	private void recordBatchSuccess(final List<ClickEvent> parsedEvents) {
+		if (parsedEvents.isEmpty()) {
+			return;
+		}
+		for (final ClickEvent event : parsedEvents) {
+			sqsConsumerMetrics.recordEventAge(Instant.ofEpochMilli(event.timestamp()));
+		}
+		sqsConsumerMetrics.batchSucceeded();
 	}
 
 	/**
@@ -138,6 +167,7 @@ public class ClickEventConsumer {
 		try {
 			response = sqsClient.receiveMessage(request);
 		} catch (Exception e) {
+			sqsConsumerMetrics.receiveFailed();
 			log.atWarn()
 					.setCause(e)
 					.addKeyValue("stage", "1")
@@ -145,6 +175,8 @@ public class ClickEventConsumer {
 					.log("Failed to receive Message from SQS");
 			throw e;
 		}
+		// Even an empty receive proves the consumer is alive and reaching SQS.
+		sqsConsumerMetrics.pollSucceeded();
 		log.atDebug()
 				.addKeyValue("stage", "1")
 				.addKeyValue("status", "SUCCESS")
@@ -170,6 +202,7 @@ public class ClickEventConsumer {
 			try {
 				event = parseClickEvent(message.body());
 			} catch (Exception e) {
+				sqsConsumerMetrics.parseFailed();
 				log.atWarn()
 						.setCause(e)
 						.addKeyValue("stage", "2")
