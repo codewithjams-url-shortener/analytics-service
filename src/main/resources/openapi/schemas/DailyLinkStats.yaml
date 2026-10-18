@@ -1,0 +1,29 @@
+type: object
+required: [
+  date,
+  clicks,
+  resolved,
+  expired,
+  notFound
+]
+properties:
+  date: {
+    type: string,
+    format: date
+  }
+  clicks:
+    type: integer
+    format: int64
+    description: RESOLVED clicks that day. Same value as `resolved`.
+  resolved: {
+    type: integer,
+    format: int64
+  }
+  expired: {
+    type: integer,
+    format: int64
+  }
+  notFound: {
+    type: integer,
+    format: int64
+  }

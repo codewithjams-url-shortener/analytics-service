@@ -1,0 +1,48 @@
+type: object
+required: [
+  shortCode,
+  totalClicks,
+  resolved,
+  expired,
+  notFound,
+  from,
+  to,
+  daily
+]
+properties:
+  shortCode: {
+    type: string
+  }
+  totalClicks:
+    type: integer
+    format: int64
+    description: All-time RESOLVED clicks. Same value as `resolved`.
+  resolved: {
+    type: integer,
+    format: int64
+  }
+  expired: {
+    type: integer,
+    format: int64
+  }
+  notFound: {
+    type: integer,
+    format: int64
+  }
+  lastClickedAt:
+    type: string
+    format: date-time
+    description: null if the link has never been clicked.
+  from: {
+    type: string,
+    format: date
+  }
+  to: {
+    type: string,
+    format: date
+  }
+  daily:
+    type: array
+    description: One entry per UTC day from `from` to `to`, zero-filled.
+    items:
+      $ref: "./DailyLinkStats.yaml"

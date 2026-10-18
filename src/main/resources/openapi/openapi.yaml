@@ -1,0 +1,24 @@
+openapi: 3.0.3
+info:
+  title: analytics-service API
+  version: 0.1.0
+paths:
+  /links/{shortCode}/stats:
+    $ref: "./paths/links-shortCode-stats.yaml"
+components:
+  schemas:
+    LinkStatsResponse:
+      $ref: "./schemas/LinkStatsResponse.yaml"
+    DailyLinkStats:
+      $ref: "./schemas/DailyLinkStats.yaml"
+    ErrorResponse:
+      $ref: "./schemas/ErrorResponse.yaml"
+  parameters:
+    ShortCodePathParam:
+      in: path
+      name: shortCode
+      description: Short Code whose stats are fetched
+      required: true
+      schema:
+        type: string
+        minLength: 3
