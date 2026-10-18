@@ -1,0 +1,46 @@
+parameters:
+  - $ref: "../openapi.yaml#/components/parameters/ShortCodePathParam"
+  - in: query
+    name: from
+    description: First UTC day of the daily breakdown, inclusive. Defaults to 29 days before `to`.
+    required: false
+    schema:
+      type: string
+      format: date
+  - in: query
+    name: to
+    description: Last UTC day of the daily breakdown, inclusive. Defaults to today (UTC).
+    required: false
+    schema:
+      type: string
+      format: date
+get:
+  tags:
+    - Stats
+  operationId: getLinkStats
+  summary: Get click statistics of a Short Link
+  responses:
+    "200":
+      description: Click statistics
+      content:
+        application/json:
+          schema:
+            $ref: "../schemas/LinkStatsResponse.yaml"
+    "400":
+      description: shortCode, from or to failed validation
+      content:
+        application/json:
+          schema:
+            $ref: "../schemas/ErrorResponse.yaml"
+    "404":
+      description: Short Link not found
+      content:
+        application/json:
+          schema:
+            $ref: "../schemas/ErrorResponse.yaml"
+    default:
+      description: Unexpected error
+      content:
+        application/json:
+          schema:
+            $ref: "../schemas/ErrorResponse.yaml"

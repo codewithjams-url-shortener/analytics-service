@@ -36,6 +36,17 @@ public class JdbcLinksMirrorRepository implements LinksMirrorRepository {
 			deletion_reason = EXCLUDED.deletion_reason
 			""";
 
+	/**
+	 * Checks for a row in the {@code links} mirror, soft-deleted or not.
+	 */
+	private static final String EXISTS_BY_SHORT_CODE_QUERY = """
+		SELECT EXISTS (
+			SELECT 1
+			FROM links
+			WHERE short_code = :shortCode
+		)
+		""";
+
 	private final JdbcClient jdbcClient;
 
 	/**
@@ -71,6 +82,17 @@ public class JdbcLinksMirrorRepository implements LinksMirrorRepository {
 		log.atInfo()
 				.addKeyValue("updated", rowsUpdated > 0)
 				.log("Link upserted");
+	}
+
+	/**
+	 * {@inheritDoc}
+	 */
+	@Override
+	public boolean existsByShortCode(final String shortCode) {
+		return jdbcClient.sql(EXISTS_BY_SHORT_CODE_QUERY)
+				.param("shortCode", shortCode)
+				.query(Boolean.class)
+				.single();
 	}
 
 }

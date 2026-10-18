@@ -36,6 +36,9 @@ class JdbcLinksMirrorRepositoryTest {
 	@Mock(answer = Answers.RETURNS_SELF)
 	private JdbcClient.StatementSpec statementSpec;
 
+	@Mock
+	private JdbcClient.MappedQuerySpec<Boolean> existsQuery;
+
 	private JdbcLinksMirrorRepository repository;
 
 	@BeforeEach
@@ -145,6 +148,52 @@ class JdbcLinksMirrorRepositoryTest {
 		assertThatThrownBy(() -> repository.upsertLink(liveLink()))
 				.isInstanceOf(IllegalStateException.class)
 				.hasMessage("Postgres unavailable");
+	}
+
+	@Test
+	void existsByShortCode_shouldReturnTrueAndBindTheShortCode_whenTheMirrorHoldsARow() {
+		// Arrange
+		given(statementSpec.query(Boolean.class)).willReturn(existsQuery);
+		given(existsQuery.single()).willReturn(true);
+
+		// Act
+		final boolean result = repository.existsByShortCode("abc1234");
+
+		// Assert
+		assertThat(result).isTrue();
+		verify(statementSpec).param("shortCode", "abc1234");
+	}
+
+	@Test
+	void existsByShortCode_shouldReturnFalse_whenTheMirrorHoldsNoRow() {
+		// Arrange
+		given(statementSpec.query(Boolean.class)).willReturn(existsQuery);
+		given(existsQuery.single()).willReturn(false);
+
+		// Act
+		final boolean result = repository.existsByShortCode("abc1234");
+
+		// Assert
+		assertThat(result).isFalse();
+	}
+
+	@Test
+	void existsByShortCode_shouldCountSoftDeletedRows_whenQueryingTheMirror() {
+		// Arrange
+		given(statementSpec.query(Boolean.class)).willReturn(existsQuery);
+		given(existsQuery.single()).willReturn(true);
+
+		// Act
+		repository.existsByShortCode("abc1234");
+
+		// Assert
+		// A soft-deleted link keeps its click history, so the check must not filter on deleted_at.
+		final ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+		verify(jdbcClient).sql(sqlCaptor.capture());
+		assertThat(sqlCaptor.getValue())
+				.contains("FROM links")
+				.contains("short_code = :shortCode")
+				.doesNotContain("deleted_at");
 	}
 
 	private MirroredLink liveLink() {
