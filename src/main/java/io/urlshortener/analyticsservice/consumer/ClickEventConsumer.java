@@ -3,11 +3,14 @@ package io.urlshortener.analyticsservice.consumer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.tracing.Span;
 import io.urlshortener.analyticsservice.metrics.SqsConsumerMetrics;
 import io.urlshortener.analyticsservice.property.AwsProperties;
 import io.urlshortener.analyticsservice.repository.ClickEventArchiver;
 import io.urlshortener.analyticsservice.service.ClickEventRecorder;
+import io.urlshortener.analyticsservice.tracing.ClickEventTracing;
 import io.urlshortener.eventcontracts.ClickEvent;
+import io.urlshortener.servicecommon.TraceContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -40,6 +43,13 @@ import java.util.*;
  *         a redelivered batch can be archived twice, so readers of the archive should dedupe on {@code eventId}.
  *     </li>
  * </ul>
+ *
+ * <p>
+ *     Each parsed message also gets a {@code CONSUMER} span, started as a child of the span redirect-service published it
+ *     under, from the trace context carried in the SNS envelope (see {@link ClickEventTracing}), so one trace runs from
+ *     the redirect request through to here. The span ends when the message's batch is acknowledged, or as an error if
+ *     the batch fails and the message stays on the queue.
+ * </p>
  *
  * <p>
  *     A message that fails only to *parse* is treated differently from a batch processing failure: it's simply left off
@@ -83,6 +93,11 @@ public class ClickEventConsumer {
 	private final SqsConsumerMetrics sqsConsumerMetrics;
 
 	/**
+	 * Continues redirect-service's trace for each event, from the context carried in its message.
+	 */
+	private final ClickEventTracing clickEventTracing;
+
+	/**
 	 * Runs one poll-and-process cycle: receive, parse, record (one transaction covering the events and both rollups),
 	 * archive, then delete only the messages that made it all the way through.
 	 */
@@ -102,13 +117,15 @@ public class ClickEventConsumer {
 			return;
 		}
 
-		final Map<Message, ClickEvent> parsed = createSqsMessageClickEventMap(messages);
+		final Map<Message, ParsedMessage> parsed = createSqsMessageClickEventMap(messages);
+		final Map<Message, Span> spans = startConsumerSpans(parsed);
 
 		try {
-			final List<ClickEvent> parsedEvents = parsed.values().stream().toList();
+			final List<ClickEvent> parsedEvents = parsed.values().stream().map(ParsedMessage::event).toList();
 			final int newEventCount = clickEventRecorder.record(parsedEvents);
 			clickEventArchiver.archive(parsedEvents);
 			deleteMessages(parsed.keySet());
+			endSpansAcknowledged(parsed, spans);
 			recordBatchSuccess(parsedEvents);
 			log.atInfo()
 					.addKeyValue("status", "SUCCESS")
@@ -118,6 +135,7 @@ public class ClickEventConsumer {
 					.addKeyValue("duplicateEvents", parsed.size() - newEventCount)
 					.log("ClickEvent batch processed successfully");
 		} catch (RuntimeException e) {
+			endSpansFailed(parsed, spans, e);
 			sqsConsumerMetrics.batchFailed();
 			log.atError()
 					.setCause(e)
@@ -191,16 +209,16 @@ public class ClickEventConsumer {
 	 * @return the successfully parsed messages, keyed by their originating SQS {@link Message} so the receipt handle is
 	 * still available for deletion later.
 	 */
-	private Map<Message, ClickEvent> createSqsMessageClickEventMap(final List<Message> messages) {
+	private Map<Message, ParsedMessage> createSqsMessageClickEventMap(final List<Message> messages) {
 		log.atDebug()
 				.addKeyValue("stage", "2")
 				.addKeyValue("status", "STARTED")
 				.log("Create SQS Message - ClickEvent Map");
-		final Map<Message, ClickEvent> parsed = new LinkedHashMap<>();
+		final Map<Message, ParsedMessage> parsed = new LinkedHashMap<>();
 		for (final Message message : messages) {
-			final ClickEvent event;
+			final ParsedMessage parsedMessage;
 			try {
-				event = parseClickEvent(message.body());
+				parsedMessage = parseClickEvent(message.body());
 			} catch (Exception e) {
 				sqsConsumerMetrics.parseFailed();
 				log.atWarn()
@@ -211,7 +229,7 @@ public class ClickEventConsumer {
 						.log("Failed to parse ClickEvent message, leaving it for redelivery/DLQ");
 				continue;
 			}
-			parsed.put(message, event);
+			parsed.put(message, parsedMessage);
 		}
 		log.atDebug()
 				.addKeyValue("stage", "2")
@@ -230,7 +248,7 @@ public class ClickEventConsumer {
 	 * @return the parsed {@link ClickEvent}.
 	 * @throws JsonProcessingException if the envelope or the inner event JSON is malformed.
 	 */
-	private ClickEvent parseClickEvent(final String messageBody) throws JsonProcessingException {
+	private ParsedMessage parseClickEvent(final String messageBody) throws JsonProcessingException {
 		log.atDebug()
 				.addKeyValue("stage", "2.1")
 				.addKeyValue("status", "STARTED")
@@ -273,7 +291,53 @@ public class ClickEventConsumer {
 				.addKeyValue("status", "SUCCESS")
 				.addKeyValue("messageId", messageId)
 				.log("ClickEvent parsed from SQS Message");
-		return clickEvent;
+		return new ParsedMessage(clickEvent, clickEventTracing.contextOf(envelop));
+	}
+
+	/**
+	 * A parsed message: the click event, and the trace context that travelled with it.
+	 *
+	 * @param event        the click event.
+	 * @param traceContext what redirect-service sent to continue the trace; fields it did not send are {@code null}.
+	 */
+	private record ParsedMessage(ClickEvent event, TraceContext traceContext) {
+	}
+
+	/**
+	 * Starts a span for every parsed message, each a child of the span that published it.
+	 *
+	 * @param parsed the parsed messages of the batch.
+	 * @return the started spans, keyed by their message, which must all be ended.
+	 */
+	private Map<Message, Span> startConsumerSpans(final Map<Message, ParsedMessage> parsed) {
+		final Map<Message, Span> spans = new LinkedHashMap<>();
+		parsed.forEach((message, parsedMessage) -> spans.put(message,
+				clickEventTracing.startConsumerSpan(parsedMessage.traceContext(), parsedMessage.event())));
+		return spans;
+	}
+
+	/**
+	 * Ends the spans of a batch that was recorded, archived and deleted.
+	 *
+	 * @param parsed the parsed messages of the batch.
+	 * @param spans  their spans.
+	 */
+	private void endSpansAcknowledged(final Map<Message, ParsedMessage> parsed, final Map<Message, Span> spans) {
+		parsed.forEach((message, parsedMessage) -> clickEventTracing.endAcknowledged(
+				spans.get(message), parsedMessage.event(), parsedMessage.traceContext()));
+	}
+
+	/**
+	 * Ends the spans of a batch that failed, marking each as an error.
+	 *
+	 * @param parsed the parsed messages of the batch.
+	 * @param spans  their spans.
+	 * @param error  why the batch failed.
+	 */
+	private void endSpansFailed(final Map<Message, ParsedMessage> parsed, final Map<Message, Span> spans,
+								final RuntimeException error) {
+		parsed.forEach((message, parsedMessage) -> clickEventTracing.endFailed(
+				spans.get(message), parsedMessage.event(), error));
 	}
 
 	/**
