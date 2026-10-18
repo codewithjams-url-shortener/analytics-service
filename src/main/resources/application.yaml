@@ -30,6 +30,13 @@ management:
 server:
   port: 5235
 
+logging:
+  level:
+    io.urlshortener: INFO
+  structured:
+    format:
+      console: ecs
+
 aws:
   region: us-west-2
   credential:
