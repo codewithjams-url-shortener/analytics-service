@@ -1,0 +1,26 @@
+# Tunable constants for the integrationTest source set. Kept separate from run-specific values
+# (integration-test.app-jar, integration-test.url-service-app-jar, integration-test.redirect-service-app-jar,
+# integration-test.base-url, integration-test.url-service-base-url, integration-test.redirect-service-base-url), which
+# are supplied per-invocation via Gradle system properties instead, since they're targets for a given run rather than
+# fixed constants.
+integration-test:
+  local:
+    links-table-name: Links
+    links-table-partition-key: shortCode
+    click-events-topic-name: click-events
+    click-events-queue-name: click-events-queue
+    # Short, so the redelivery of a failed batch is observable in seconds rather than after the 30s default.
+    click-events-queue-visibility-timeout-seconds: 5
+    bucket-name: url-shortener-events
+    postgres-image: postgres:15-alpine
+    database-name: url_shortener
+    database-username: url_shortener_admin
+    database-password: test
+    redis-image: redis:7-alpine
+    health-check-timeout: 90s
+    health-check-poll-interval: 500ms
+  # The click pipeline has two 5s waits (the SQS long poll and the consumer's fixedDelay) before a click shows up in
+  # the stats, so polls need a generous ceiling.
+  await:
+    timeout: 90s
+    poll-interval: 1s
