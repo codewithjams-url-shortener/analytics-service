@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Iterator;
+import java.util.OptionalDouble;
 import java.util.UUID;
 import java.util.function.Predicate;
 
@@ -174,6 +175,36 @@ public abstract class IntegrationTestSupport {
 				})
 				.retrieve()
 				.toEntity(JsonNode.class);
+	}
+
+	/**
+	 * Reads analytics-service's Prometheus scrape, as Prometheus itself would.
+	 *
+	 * @return the scrape in the Prometheus text format.
+	 */
+	protected String getPrometheus() {
+		return analyticsApiClient.get()
+				.uri("/actuator/prometheus")
+				.retrieve()
+				.body(String.class);
+	}
+
+	/**
+	 * Finds one sample in a Prometheus scrape.
+	 *
+	 * @param scrape        the scrape text.
+	 * @param name          the exact sample name, such as {@code sqs_consumer_batches_total}.
+	 * @param labelFragment text the sample's labels must contain, such as {@code outcome="success"}, or {@code null} to
+	 *                      take the first sample with that name.
+	 * @return the sample's value, or empty if there is no such sample.
+	 */
+	protected static OptionalDouble metricValue(final String scrape, final String name, final String labelFragment) {
+		return scrape.lines()
+				.filter(line -> line.startsWith(name + "{") || line.startsWith(name + " "))
+				.filter(line -> labelFragment == null || line.contains(labelFragment))
+				.findFirst()
+				.map(line -> OptionalDouble.of(Double.parseDouble(line.substring(line.lastIndexOf(' ') + 1))))
+				.orElse(OptionalDouble.empty());
 	}
 
 	/**
