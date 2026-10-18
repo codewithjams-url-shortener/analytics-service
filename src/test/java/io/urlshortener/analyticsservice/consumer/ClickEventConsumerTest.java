@@ -1,10 +1,14 @@
 package io.urlshortener.analyticsservice.consumer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.sdk.trace.data.SpanData;
 import io.urlshortener.analyticsservice.metrics.SqsConsumerMetrics;
 import io.urlshortener.analyticsservice.property.AwsProperties;
 import io.urlshortener.analyticsservice.repository.ClickEventArchiver;
 import io.urlshortener.analyticsservice.service.ClickEventRecorder;
+import io.urlshortener.analyticsservice.tracing.ClickEventTracing;
+import io.urlshortener.analyticsservice.tracing.OtelTracingFixture;
 import io.urlshortener.eventcontracts.ClickEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,6 +57,8 @@ class ClickEventConsumerTest {
 	@Mock
 	private SqsConsumerMetrics sqsConsumerMetrics;
 
+	private OtelTracingFixture tracing;
+
 	private ClickEventConsumer consumer;
 
 	@BeforeEach
@@ -62,8 +68,10 @@ class ClickEventConsumerTest {
 		final AwsProperties awsProperties = new AwsProperties();
 		awsProperties.setSqs(sqs);
 
+		tracing = new OtelTracingFixture();
 		consumer = new ClickEventConsumer(sqsClient, awsProperties, new ObjectMapper(), clickEventRecorder,
-				clickEventArchiver, sqsConsumerMetrics);
+				clickEventArchiver, sqsConsumerMetrics,
+				new ClickEventTracing(tracing.tracer(), tracing.propagator(), awsProperties));
 	}
 
 	@Test
@@ -380,6 +388,149 @@ class ClickEventConsumerTest {
 		assertThatThrownBy(() -> consumer.pollAndProcess()).isInstanceOf(RuntimeException.class);
 		verify(sqsConsumerMetrics).receiveFailed();
 		verify(sqsConsumerMetrics, never()).pollSucceeded();
+	}
+
+	@Test
+	void pollAndProcess_shouldContinueTheProducersTrace_whenTheMessageCarriesATraceparent() {
+		// Arrange
+		final String traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
+		final String producerSpanId = "00f067aa0ba902b7";
+		final Message message = sqsMessage("msg-1", envelopeWithTraceparent(
+				"event-1", "abc1234", "RESOLVED", "00-%s-%s-01".formatted(traceId, producerSpanId)));
+		givenBatchSucceeds(message);
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		// Parsed from inside the SNS envelope: with the real sns-sqs module the attributes are not on the SQS message.
+		final SpanData span = onlyConsumerSpan();
+		assertThat(span.getTraceId()).isEqualTo(traceId);
+		assertThat(span.getParentSpanId()).isEqualTo(producerSpanId);
+		assertThat(span.getStatus().getStatusCode()).isNotEqualTo(StatusCode.ERROR);
+	}
+
+	@Test
+	void pollAndProcess_shouldStartOneSpanPerMessageEachInItsOwnTrace_whenMessagesCarryDifferentContexts() {
+		// Arrange
+		final Message first = sqsMessage("msg-1", envelopeWithTraceparent("event-1", "abc1234", "RESOLVED",
+				"00-11111111111111111111111111111111-aaaaaaaaaaaaaaaa-01"));
+		final Message second = sqsMessage("msg-2", envelopeWithTraceparent("event-2", "xyz7890", "EXPIRED",
+				"00-22222222222222222222222222222222-bbbbbbbbbbbbbbbb-01"));
+		givenBatchSucceeds(first, second);
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		assertThat(tracing.finishedSpans())
+				.extracting(SpanData::getTraceId, SpanData::getParentSpanId)
+				.containsExactlyInAnyOrder(
+						org.assertj.core.groups.Tuple.tuple("11111111111111111111111111111111", "aaaaaaaaaaaaaaaa"),
+						org.assertj.core.groups.Tuple.tuple("22222222222222222222222222222222", "bbbbbbbbbbbbbbbb"));
+	}
+
+	@Test
+	void pollAndProcess_shouldStillProcessTheEventInANewTrace_whenTheMessageCarriesNoContext() {
+		// Arrange
+		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
+		givenBatchSucceeds(message);
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		// A message sent without tracing (older, or from a service that does not propagate) must still be counted.
+		verify(clickEventRecorder).record(anyList());
+		verify(sqsClient).deleteMessageBatch(any(DeleteMessageBatchRequest.class));
+		assertThat(onlyConsumerSpan().getParentSpanContext().isValid()).isFalse();
+	}
+
+	@Test
+	void pollAndProcess_shouldEndTheSpansAsErrors_whenRecordingFails() {
+		// Arrange
+		final Message message = sqsMessage("msg-1", envelopeWithTraceparent("event-1", "abc1234", "RESOLVED",
+				"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"));
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
+		given(clickEventRecorder.record(anyList())).willThrow(new RuntimeException("DB unavailable"));
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		// The message stays on the queue, so the trace shows the attempt as a failure rather than a clean run.
+		final SpanData span = onlyConsumerSpan();
+		assertThat(span.getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+		assertThat(span.getEvents()).anyMatch(event -> event.getName().equals("exception"));
+	}
+
+	@Test
+	void pollAndProcess_shouldEndTheSpansAsErrors_whenArchivingFailsAfterRecordingSucceeds() {
+		// Arrange
+		final Message message = sqsMessage("msg-1", envelope("event-1", "abc1234", "RESOLVED"));
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(message).build());
+		given(clickEventRecorder.record(anyList())).willReturn(1);
+		doThrow(new RuntimeException("S3 unavailable")).when(clickEventArchiver).archive(any());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		assertThat(onlyConsumerSpan().getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+	}
+
+	@Test
+	void pollAndProcess_shouldStartNoSpan_whenEveryMessageIsUnparseable() {
+		// Arrange
+		final Message bad = sqsMessage("msg-bad", "not-valid-json");
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(bad).build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		assertThat(tracing.finishedSpans()).isEmpty();
+	}
+
+	@Test
+	void pollAndProcess_shouldStartNoSpan_whenNoMessagesAreReceived() {
+		// Arrange
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(List.of()).build());
+
+		// Act
+		consumer.pollAndProcess();
+
+		// Assert
+		assertThat(tracing.finishedSpans()).isEmpty();
+	}
+
+	private void givenBatchSucceeds(final Message... messages) {
+		given(sqsClient.receiveMessage(any(ReceiveMessageRequest.class)))
+				.willReturn(ReceiveMessageResponse.builder().messages(messages).build());
+		given(clickEventRecorder.record(anyList())).willReturn(messages.length);
+		given(sqsClient.deleteMessageBatch(any(DeleteMessageBatchRequest.class)))
+				.willReturn(DeleteMessageBatchResponse.builder().build());
+	}
+
+	private SpanData onlyConsumerSpan() {
+		assertThat(tracing.finishedSpans()).hasSize(1);
+		assertThat(tracing.finishedSpans().getFirst().getName()).isEqualTo("click-events process");
+		return tracing.finishedSpans().getFirst();
+	}
+
+	/**
+	 * The same SNS envelope, with the trace context redirect-service sends as a message attribute.
+	 */
+	private String envelopeWithTraceparent(final String eventId, final String shortCode, final String outcome,
+										   final String traceparent) {
+		final String envelope = envelope(eventId, shortCode, outcome);
+		final String attributes = ",\"MessageAttributes\":{\"traceparent\":{\"Type\":\"String\",\"Value\":\"%s\"}}"
+				.formatted(traceparent);
+		return envelope.substring(0, envelope.lastIndexOf('}')) + attributes + "}";
 	}
 
 	@SuppressWarnings({"unchecked", "rawtypes"})

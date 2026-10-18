@@ -46,7 +46,7 @@ import java.util.Map;
 /**
  * Wires the shared integration tests to a real {@code analytics-service}, {@code url-service} and
  * {@code redirect-service}, each launched as a genuine separate OS process (the built boot jars, not in-process
- * {@code @SpringBootTest} contexts) against Testcontainers-managed floci (DynamoDB, SNS, SQS, S3), PostgreSQL and Redis.
+ * {@code @SpringBootTest} contexts) against Testcontainers-managed floci (DynamoDB, SNS, SQS, S3), PostgreSQL, Redis and Jaeger.
  *
  * <p>
  *     {@code url-service} and {@code redirect-service} are started only to generate the traffic
@@ -76,6 +76,10 @@ import java.util.Map;
 @Profile("local")
 public class LocalEnvironmentConfig {
 
+	private static final int JAEGER_OTLP_HTTP_PORT = 4318;
+
+	private static final int JAEGER_QUERY_PORT = 16686;
+
 	private static final FlociContainer floci = new FlociContainer();
 
 	private static final PostgreSQLContainer<?> postgres =
@@ -89,6 +93,11 @@ public class LocalEnvironmentConfig {
 					.withExposedPorts(6379)
 					.waitingFor(Wait.forListeningPort());
 
+	private static final GenericContainer<?> jaeger =
+			new GenericContainer<>(DockerImageName.parse(LocalTestSettings.jaegerImage()))
+					.withExposedPorts(JAEGER_OTLP_HTTP_PORT, JAEGER_QUERY_PORT)
+					.waitingFor(Wait.forHttp("/").forPort(JAEGER_QUERY_PORT));
+
 	private static final String clickEventsTopicArn;
 
 	private static final String clickEventsQueueUrl;
@@ -97,6 +106,7 @@ public class LocalEnvironmentConfig {
 		floci.start();
 		postgres.start();
 		redis.start();
+		jaeger.start();
 		createLinksTable();
 		createBucket();
 		clickEventsTopicArn = createClickEventsTopic();
@@ -235,8 +245,10 @@ public class LocalEnvironmentConfig {
 				"-Daws.s3.bucket-name=%s".formatted(LocalTestSettings.bucketName()),
 				"-Daws.dynamodb.endpoint-override=%s".formatted(floci.getEndpoint()),
 				"-Daws.dynamodb.tables.links-table=%s".formatted(LocalTestSettings.linksTableName()),
-				// No collector runs during the tests; without this every export attempt logs a connection error.
-				"-Dmanagement.tracing.sampling.probability=0.0",
+				"-Dmanagement.otlp.tracing.endpoint=%s".formatted(jaegerOtlpEndpoint()),
+				// The per-event "acknowledged" line is debug-level; the tracing test reads it to prove consumer logs carry
+				// the trace's traceId.
+				"-Dlogging.level.io.urlshortener.analyticsservice.tracing=DEBUG",
 				"-jar", appJarPath
 		);
 		final LocalAnalyticsService service = new LocalAnalyticsService(command, port);
@@ -265,6 +277,7 @@ public class LocalEnvironmentConfig {
 				"-Daws.credential.access-key=%s".formatted(floci.getAccessKey()),
 				"-Daws.credential.secret-key=%s".formatted(floci.getSecretKey()),
 				"-Daws.dynamodb.tables.links-table=%s".formatted(LocalTestSettings.linksTableName()),
+				"-Dmanagement.otlp.tracing.endpoint=%s".formatted(jaegerOtlpEndpoint()),
 				"-jar", appJarPath
 		));
 		ProcessSupport.waitUntilHealthy("url-service", port, process);
@@ -296,6 +309,7 @@ public class LocalEnvironmentConfig {
 				"-Daws.sns.topics.click-events-topic=%s".formatted(clickEventsTopicArn),
 				"-Dspring.data.redis.host=%s".formatted(redis.getHost()),
 				"-Dspring.data.redis.port=%s".formatted(redis.getMappedPort(6379)),
+				"-Dmanagement.otlp.tracing.endpoint=%s".formatted(jaegerOtlpEndpoint()),
 				"-jar", appJarPath
 		));
 		ProcessSupport.waitUntilHealthy("redirect-service", port, process);
@@ -330,6 +344,16 @@ public class LocalEnvironmentConfig {
 	}
 
 	/**
+	 * @return a client for Jaeger's query API, for reading back the traces the three services exported.
+	 */
+	@Bean
+	public RestClient jaegerApiClient() {
+		return RestClient.builder()
+				.baseUrl("http://%s:%s".formatted(jaeger.getHost(), jaeger.getMappedPort(JAEGER_QUERY_PORT)))
+				.build();
+	}
+
+	/**
 	 * @return a template onto the Postgres container analytics-service writes to, for assertions and fault injection.
 	 */
 	@Bean
@@ -344,6 +368,10 @@ public class LocalEnvironmentConfig {
 	@Bean(destroyMethod = "close")
 	public S3Client archiveS3Client() {
 		return buildS3Client();
+	}
+
+	private static String jaegerOtlpEndpoint() {
+		return "http://%s:%s/v1/traces".formatted(jaeger.getHost(), jaeger.getMappedPort(JAEGER_OTLP_HTTP_PORT));
 	}
 
 	private static RestClient statusPreservingClient(final String baseUrl, final HttpClient.Redirect redirect) {

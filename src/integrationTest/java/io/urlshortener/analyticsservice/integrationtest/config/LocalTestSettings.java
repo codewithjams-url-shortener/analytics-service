@@ -66,6 +66,10 @@ final class LocalTestSettings {
 		return require("redis-image");
 	}
 
+	static String jaegerImage() {
+		return require("jaeger-image");
+	}
+
 	static Duration healthCheckTimeout() {
 		return DurationStyle.detectAndParse(require("health-check-timeout"));
 	}
