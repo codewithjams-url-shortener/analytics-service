@@ -17,8 +17,28 @@ java {
 }
 
 repositories {
+	// The shared libs (service-common, event-contracts, and links-contract through it) come from here, and only they:
+	// mavenLocal first so a `publishToMavenLocal` from url-shortener-shared-libs wins while iterating locally, GitHub
+	// Packages otherwise (the Jenkins build). Reading GitHub Packages needs a token with read:packages, taken from
+	// GITHUB_ACTOR and GITHUB_TOKEN or the gpr.user and gpr.token Gradle properties, the same names
+	// url-shortener-shared-libs publishes with.
+	mavenLocal {
+		content {
+			includeGroup("io.url-shortener")
+		}
+	}
+	maven {
+		name = "GitHubPackages"
+		url = uri("https://maven.pkg.github.com/codewithjams-url-shortener/url-shortener-shared-libs")
+		content {
+			includeGroup("io.url-shortener")
+		}
+		credentials {
+			username = System.getenv("GITHUB_ACTOR") ?: providers.gradleProperty("gpr.user").orNull
+			password = System.getenv("GITHUB_TOKEN") ?: providers.gradleProperty("gpr.token").orNull
+		}
+	}
 	mavenCentral()
-	mavenLocal()
 }
 
 dependencyManagement {
