@@ -18,6 +18,7 @@ import org.testcontainers.utility.DockerImageName;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeDefinition;
 import software.amazon.awssdk.services.dynamodb.model.BillingMode;
@@ -245,6 +246,9 @@ public class LocalEnvironmentConfig {
 				"-Daws.s3.bucket-name=%s".formatted(LocalTestSettings.bucketName()),
 				"-Daws.dynamodb.endpoint-override=%s".formatted(floci.getEndpoint()),
 				"-Daws.dynamodb.tables.links-table=%s".formatted(LocalTestSettings.linksTableName()),
+				"-Daws.cloudwatch.endpoint-override=%s".formatted(floci.getEndpoint()),
+				// Publish every second instead of every minute, so the tests need not wait a minute to see the counts.
+				"-Durl-shortener.http-metrics.publish-interval=PT1S",
 				"-Dmanagement.otlp.tracing.endpoint=%s".formatted(jaegerOtlpEndpoint()),
 				// The per-event "acknowledged" line is debug-level; the tracing test reads it to prove consumer logs carry
 				// the trace's traceId.
@@ -368,6 +372,18 @@ public class LocalEnvironmentConfig {
 	@Bean(destroyMethod = "close")
 	public S3Client archiveS3Client() {
 		return buildS3Client();
+	}
+
+	/**
+	 * @return a client onto the floci CloudWatch, for reading the HTTP response counts analytics-service publishes.
+	 */
+	@Bean(destroyMethod = "close")
+	public CloudWatchClient flociCloudWatchClient() {
+		return CloudWatchClient.builder()
+				.endpointOverride(URI.create(floci.getEndpoint()))
+				.region(Region.of(floci.getRegion()))
+				.credentialsProvider(credentialsProvider())
+				.build();
 	}
 
 	private static String jaegerOtlpEndpoint() {

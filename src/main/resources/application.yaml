@@ -52,4 +52,10 @@ aws:
     endpoint-override: http://localhost:4566
     tables:
       links-table: "Links"
+  cloudwatch:
+    endpoint-override: http://localhost:4566
 
+url-shortener:
+  http-metrics:
+    enabled: true
+    publish-interval: PT1M
