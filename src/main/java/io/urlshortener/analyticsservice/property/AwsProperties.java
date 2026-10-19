@@ -41,6 +41,11 @@ public class AwsProperties {
 	private DynamoDb dynamoDb;
 
 	/**
+	 * CloudWatch-specific configuration.
+	 */
+	private CloudWatch cloudWatch;
+
+	/**
 	 * Static AWS credentials, configured directly rather than resolved via the default provider chain.
 	 */
 	@Getter
@@ -117,6 +122,20 @@ public class AwsProperties {
 		 * actual table names.
 		 */
 		private Map<String, String> tables;
+
+	}
+
+	/**
+	 * CloudWatch-specific configuration: an optional local endpoint override.
+	 */
+	@Getter
+	@Setter
+	public static class CloudWatch {
+
+		/**
+		 * Local CloudWatch endpoint to target instead of the real AWS endpoint, if set (e.g. floci).
+		 */
+		private String endpointOverride;
 
 	}
 
